@@ -33,6 +33,7 @@ class LazyMatImageDataset(Dataset):
         transform=None,
         dtype: str = "float32",
         normalize_255: bool = True,
+        image_axes: Optional[Tuple[int, ...]] = None,
     ):
         self.mat_files = list(mat_files)
         if len(self.mat_files) == 1 and any(ch in self.mat_files[0] for ch in "*?[]"):
@@ -47,6 +48,7 @@ class LazyMatImageDataset(Dataset):
         self.transform = transform
         self.dtype = dtype
         self.normalize_255 = normalize_255
+        self._axes_override = image_axes
 
         # Internal index mapping: global_idx -> (file_idx, local_idx)
         self._index: List[Tuple[int, int]] = []
@@ -76,7 +78,7 @@ class LazyMatImageDataset(Dataset):
                     img_ds = f[self.image_key]
 
                 shape = tuple(img_ds.shape)
-                n, c, h, w, axes = _interpret_image_shape(shape)
+                n, c, h, w, axes = _interpret_image_shape(shape, override=self._axes_override)
 
                 # If labels requested, validate existence and length
                 if self.label_key is not None:
@@ -152,50 +154,85 @@ class LazyMatImageDataset(Dataset):
             pass
 
 
-def _interpret_image_shape(shape: Tuple[int, ...]) -> Tuple[int, int, int, int, Tuple[int, int, int, int]]:
+def _interpret_image_shape(
+    shape: Tuple[int, ...], override: Optional[Tuple[int, ...]] = None
+) -> Tuple[int, int, int, int, Tuple[int, ...]]:
     """Infer N, C, H, W and axes order given a shape.
 
-    Returns (N, C, H, W, axes) where axes is a tuple specifying which original axes correspond to N,C,H,W.
+    Returns (N, C, H, W, axes) where axes maps original axes to the logical order
+    (N, C, H, W). For 2D grayscale (N, H, W) inputs the channel dimension is
+    synthesized and axes is length 3 (mapping to N, H, W).
     """
-    if len(shape) != 4:
-        raise ValueError(f"Unsupported image rank {len(shape)}; expected 4D, got {shape}")
-
-    # Try common layouts
-    candidates = [
-        (0, 3, 1, 2),  # N,H,W,C -> N,C,H,W
-        (0, 1, 2, 3),  # N,C,H,W -> N,C,H,W
-        (3, 2, 0, 1),  # H,W,C,N -> N,C,H,W
-        (3, 0, 1, 2),  # C,H,W,N -> N,C,H,W
-    ]
-    for axes in candidates:
-        n = shape[axes[0]]
-        c = shape[axes[1]]
-        h = shape[axes[2]]
-        w = shape[axes[3]]
-        if all(x > 0 for x in (n, c, h, w)):
+    if override is not None:
+        axes = tuple(override)
+        rank = len(shape)
+        if len(axes) not in (3, 4):
+            raise ValueError("image_axes override must have length 3 or 4")
+        if len(axes) != rank:
+            raise ValueError(f"image_axes override length {len(axes)} does not match rank {rank}")
+        dims = [shape[a] for a in axes]
+        if len(axes) == 4:
+            n, c, h, w = dims
             return n, c, h, w, axes
-    raise ValueError(f"Unable to infer N,C,H,W from shape {shape}")
+        else:
+            n, h, w = dims
+            return n, 1, h, w, axes
+
+    rank = len(shape)
+    if rank == 4:
+        candidates = [
+            (0, 3, 1, 2),  # N,H,W,C -> N,C,H,W
+            (0, 1, 2, 3),  # N,C,H,W -> N,C,H,W
+            (3, 2, 0, 1),  # H,W,C,N -> N,C,H,W
+            (3, 0, 1, 2),  # C,H,W,N -> N,C,H,W
+        ]
+        for axes in candidates:
+            n = shape[axes[0]]
+            c = shape[axes[1]]
+            h = shape[axes[2]]
+            w = shape[axes[3]]
+            if all(x > 0 for x in (n, c, h, w)):
+                return n, c, h, w, axes
+        raise ValueError(f"Unable to infer N,C,H,W from shape {shape}")
+    elif rank == 3:
+        candidates = [
+            (0, 1, 2),  # N,H,W
+            (0, 2, 1),  # N,W,H
+            (2, 0, 1),  # W,N,H
+            (2, 1, 0),  # W,H,N
+            (1, 0, 2),  # H,N,W
+            (1, 2, 0),  # H,W,N
+        ]
+        for axes in candidates:
+            n = shape[axes[0]]
+            h = shape[axes[1]]
+            w = shape[axes[2]]
+            if all(x > 0 for x in (n, h, w)):
+                return n, 1, h, w, axes
+        raise ValueError(f"Unable to infer N,H,W from shape {shape}")
+    else:
+        raise ValueError(f"Unsupported image rank {rank}; expected 3D/4D, got {shape}")
 
 
-def _ensure_chw(arr: np.ndarray, axes: Tuple[int, int, int, int]) -> np.ndarray:
-    """Move axes to CHW given original axes mapping for N,C,H,W.
-
-    Input arr is a single-sample array where the N axis has been indexed out.
-    We must map remaining axes to C,H,W in order.
-    """
-    # After slicing out N, dimensions dropped: find positions of C,H,W in the remaining array
-    orig_positions = list(range(4))
+def _ensure_chw(arr: np.ndarray, axes: Tuple[int, ...]) -> np.ndarray:
+    """Move axes to CHW given original axes mapping for N,(C),H,W."""
     n_axis = axes[0]
-    # Remove N axis position and adjust the rest
     remaining_axes = []
     for a in axes[1:]:
         if a < n_axis:
             remaining_axes.append(a)
         else:
             remaining_axes.append(a - 1)
-    # remaining_axes correspond to (C,H,W) positions in the sliced array
-    c_pos, h_pos, w_pos = remaining_axes
-    return np.moveaxis(arr, (c_pos, h_pos, w_pos), (0, 1, 2))
+
+    if len(remaining_axes) == 3:
+        c_pos, h_pos, w_pos = remaining_axes
+        return np.moveaxis(arr, (c_pos, h_pos, w_pos), (0, 1, 2))
+    elif len(remaining_axes) == 2:
+        h_pos, w_pos = remaining_axes
+        arr_hw = np.moveaxis(arr, (h_pos, w_pos), (0, 1))
+        return np.expand_dims(arr_hw, axis=0)
+    else:
+        raise ValueError("Unexpected axes configuration for image array")
 
 
 def _read_label(lbl_ds: h5py.Dataset, idx: int) -> int:

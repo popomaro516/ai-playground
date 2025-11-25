@@ -176,3 +176,16 @@ runs/
 
 # datasets
 data/
+
+# pdfs
+*.pdf
+
+# presentations at lib
+/slide/
+
+# locally downloaded tool archives
+.bin/
+
+# training / evaluation outputs
+result/
+simsiam_fastap_package/
