@@ -24,6 +24,8 @@ from typing import List, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from PIL import Image
 
 from mat_ssl.datasets.lazy_mat import LazyMatImageDataset
 
@@ -41,6 +43,9 @@ DEFAULT_SMOOTH_WINDOW = 5
 DEFAULT_PERCENTILE = 20.0
 DEFAULT_MIN_STABLE_LENGTH = 3
 DEFAULT_DTYPE = "float32"
+DEFAULT_REFERENCE_PERCENTILE = 50.0
+DEFAULT_REFERENCE_METRIC = "mse"
+DEFAULT_REFERENCE_MODE = "bmode"
 
 
 def parse_args() -> argparse.Namespace:
@@ -100,6 +105,32 @@ def parse_args() -> argparse.Namespace:
         default="cpu",
         help="Computation device (e.g. 'cpu', 'cuda'). Stays on CPU if CUDA unavailable.",
     )
+    parser.add_argument(
+        "--reference_image",
+        type=str,
+        default="",
+        help="Optional reference image path (e.g. docs/invivo_normalized.png).",
+    )
+    parser.add_argument(
+        "--reference_percentile",
+        type=float,
+        default=DEFAULT_REFERENCE_PERCENTILE,
+        help="Percentile threshold for reference similarity (lower => more similar).",
+    )
+    parser.add_argument(
+        "--reference_metric",
+        type=str,
+        choices=("mse", "cosine"),
+        default=DEFAULT_REFERENCE_METRIC,
+        help="Similarity metric to reference image.",
+    )
+    parser.add_argument(
+        "--reference_mode",
+        type=str,
+        choices=("bmode", "raw"),
+        default=DEFAULT_REFERENCE_MODE,
+        help="Preprocess frames before reference matching.",
+    )
     return parser.parse_args()
 
 
@@ -112,6 +143,21 @@ def _moving_average(arr: np.ndarray, window: int) -> np.ndarray:
     if smoothed.shape[0] > arr.shape[0]:
         smoothed = smoothed[: arr.shape[0]]
     return smoothed.astype(np.float64)
+
+
+def _bmode_tensor(frame: torch.Tensor) -> torch.Tensor:
+    frame = torch.abs(frame)
+    frame = frame / (frame.max() + 1e-12)
+    frame = 20.0 * torch.log10(frame + 1e-12)
+    frame = torch.clamp(frame, -60.0, 0.0)
+    frame = (frame + 60.0) / 60.0
+    return frame
+
+
+def _load_reference_image(path: Path) -> torch.Tensor:
+    img = Image.open(path).convert("L")
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)  # 1x1xH xW
 
 
 def compute_motion_scores(dataset: LazyMatImageDataset, device: torch.device) -> np.ndarray:
@@ -131,6 +177,39 @@ def compute_motion_scores(dataset: LazyMatImageDataset, device: torch.device) ->
         prev = frame
     if prev is not None:
         prev = prev.detach().cpu()
+    return np.asarray(scores, dtype=np.float64)
+
+
+def compute_reference_scores(
+    dataset: LazyMatImageDataset,
+    device: torch.device,
+    ref_image: torch.Tensor,
+    mode: str,
+    metric: str,
+) -> np.ndarray:
+    scores: List[float] = []
+    ref = ref_image.to(device=device, dtype=torch.float32)
+    ref_hw = (ref.shape[-2], ref.shape[-1])
+    for idx in range(len(dataset)):
+        frame = dataset[idx]
+        if isinstance(frame, (tuple, list)):
+            frame = frame[0]
+        frame = frame.to(device=device, dtype=torch.float32, non_blocking=True)
+        if frame.dim() == 2:
+            frame = frame.unsqueeze(0)
+        if frame.shape[0] > 1:
+            frame = frame.mean(dim=0, keepdim=True)
+        if mode == "bmode":
+            frame = _bmode_tensor(frame)
+        frame = frame.unsqueeze(0)  # 1x1xH xW
+        frame = F.interpolate(frame, size=ref_hw, mode="bilinear", align_corners=False)
+        if metric == "mse":
+            score = (frame - ref).pow(2).mean().item()
+        else:
+            flat_frame = frame.view(1, -1)
+            flat_ref = ref.view(1, -1)
+            score = float(1.0 - F.cosine_similarity(flat_frame, flat_ref).item())
+        scores.append(score)
     return np.asarray(scores, dtype=np.float64)
 
 
@@ -154,13 +233,26 @@ def enforce_min_segment(labels: np.ndarray, min_len: int) -> np.ndarray:
     return labels
 
 
-def save_csv(path: Path, scores: np.ndarray, smooth_scores: np.ndarray, labels: np.ndarray) -> None:
+def save_csv(
+    path: Path,
+    scores: np.ndarray,
+    smooth_scores: np.ndarray,
+    labels: np.ndarray,
+    ref_scores: Optional[np.ndarray] = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["frame", "label", "score", "smooth_score"])
-        for idx, (lab, sc, sm) in enumerate(zip(labels, scores, smooth_scores)):
-            writer.writerow([idx, int(lab), float(sc), float(sm)])
+        header = ["frame", "label", "score", "smooth_score"]
+        if ref_scores is not None:
+            header.append("ref_score")
+        writer.writerow(header)
+        if ref_scores is None:
+            for idx, (lab, sc, sm) in enumerate(zip(labels, scores, smooth_scores)):
+                writer.writerow([idx, int(lab), float(sc), float(sm)])
+        else:
+            for idx, (lab, sc, sm, rs) in enumerate(zip(labels, scores, smooth_scores, ref_scores)):
+                writer.writerow([idx, int(lab), float(sc), float(sm), float(rs)])
 
 
 def generate_labels(args: argparse.Namespace) -> None:
@@ -182,8 +274,23 @@ def generate_labels(args: argparse.Namespace) -> None:
     smooth_scores = _moving_average(scores, args.smooth_window)
     threshold = np.percentile(smooth_scores, args.percentile)
     labels = (smooth_scores <= threshold).astype(np.int32)
+    ref_scores: Optional[np.ndarray] = None
+    if args.reference_image:
+        ref_path = Path(args.reference_image)
+        if not ref_path.exists():
+            raise FileNotFoundError(f"reference_image not found: {ref_path}")
+        ref_image = _load_reference_image(ref_path)
+        ref_scores = compute_reference_scores(
+            dataset,
+            device,
+            ref_image,
+            mode=args.reference_mode,
+            metric=args.reference_metric,
+        )
+        ref_threshold = np.percentile(ref_scores, args.reference_percentile)
+        labels = labels & (ref_scores <= ref_threshold)
     labels = enforce_min_segment(labels, args.min_stable_length)
-    save_csv(output_csv, scores, smooth_scores, labels)
+    save_csv(output_csv, scores, smooth_scores, labels, ref_scores)
 
 
 def main() -> None:
